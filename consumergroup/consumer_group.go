@@ -9,6 +9,7 @@ import (
 
 	"github.com/Shopify/sarama"
 	"github.com/wvanbergen/kazoo-go"
+	"golang.org/x/time/rate"
 )
 
 var (
@@ -37,6 +38,10 @@ func NewConfig() *Config {
 	config.Offsets.CommitInterval = 10 * time.Second
 
 	return config
+}
+
+func newDefaultLimiter() *rate.Limiter {
+	return rate.NewLimiter(rate.Every(time.Second), 4)
 }
 
 func (cgc *Config) Validate() error {
@@ -252,6 +257,7 @@ func (cg *ConsumerGroup) FlushOffsets() error {
 }
 
 func (cg *ConsumerGroup) topicListConsumer(topics []string) {
+	limiter := newDefaultLimiter()
 	for {
 		select {
 		case <-cg.stopper:
@@ -259,16 +265,19 @@ func (cg *ConsumerGroup) topicListConsumer(topics []string) {
 		default:
 		}
 
+		ctx, cancel := context.WithCancel(context.Background())
+		limiter.Wait(ctx)
+
 		consumers, consumerChanges, err := cg.group.WatchInstances()
 		if err != nil {
 			cg.Logf("FAILED to get list of registered consumer instances: %s\n", err)
+			cancel()
 			return
 		}
 
 		cg.consumers = consumers
 		cg.Logf("Currently registered consumers: %d\n", len(cg.consumers))
 
-		ctx, cancel := context.WithCancel(context.Background())
 		for _, topic := range topics {
 			cg.wg.Add(1)
 			go cg.topicConsumer(ctx, cancel, topic, cg.messages, cg.errors)
