@@ -247,9 +247,7 @@ func (cg *ConsumerGroup) Logf(format string, args ...interface{}) {
 	if cg.instance == nil {
 		identifier = "(defunct)"
 	} else {
-		if cg.existInstance() {
 			identifier = cg.instance.ID[len(cg.instance.ID)-12:]
-		}
 	}
 	sarama.Logger.Printf("[%s/%s] %s", cg.group.Name, identifier, fmt.Sprintf(format, args...))
 }
