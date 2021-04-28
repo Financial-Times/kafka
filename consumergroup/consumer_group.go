@@ -259,8 +259,15 @@ func (cg *ConsumerGroup) FlushOffsets() error {
 func (cg *ConsumerGroup) topicListConsumer(topics []string) {
 	limiter := newDefaultLimiter()
 	for {
+		// Ensure that we wait for the cg.topicConsumer() Go routines to complete in cg.Close()
+		// This has to happen before checking the cg.stopper channel because otherwise
+		// the select may be executed before the cg.wg.Wait() in cg.Close() and
+		// the resource cleanup will continue while we are tring to modify the resources (and a panic may occur)
+		cg.wg.Add(1)
+
 		select {
 		case <-cg.stopper:
+			cg.wg.Done()
 			return
 		default:
 		}
@@ -271,6 +278,7 @@ func (cg *ConsumerGroup) topicListConsumer(topics []string) {
 		consumers, consumerChanges, err := cg.group.WatchInstances()
 		if err != nil {
 			cg.Logf("FAILED to get list of registered consumer instances: %s\n", err)
+			cg.wg.Done()
 			cancel()
 			return
 		}
@@ -282,6 +290,9 @@ func (cg *ConsumerGroup) topicListConsumer(topics []string) {
 			cg.wg.Add(1)
 			go cg.topicConsumer(ctx, cancel, topic, cg.messages, cg.errors)
 		}
+
+		// Ensure that we wait for the cg.topicConsumer() Go routines to complete in cg.Close()
+		cg.wg.Done()
 
 		select {
 		case <-ctx.Done():
