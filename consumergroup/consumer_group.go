@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/Shopify/sarama"
+	"github.com/samuel/go-zookeeper/zk"
 	"github.com/wvanbergen/kazoo-go"
 	"golang.org/x/time/rate"
 )
@@ -40,10 +41,6 @@ func NewConfig() *Config {
 	return config
 }
 
-func newDefaultLimiter() *rate.Limiter {
-	return rate.NewLimiter(rate.Every(time.Second), 4)
-}
-
 func (cgc *Config) Validate() error {
 	if cgc.Zookeeper.Timeout <= 0 {
 		return sarama.ConfigurationError("ZookeeperTimeout should have a duration > 0")
@@ -66,15 +63,28 @@ func (cgc *Config) Validate() error {
 	return nil
 }
 
+func newDefaultLimiter() *rate.Limiter {
+	return rate.NewLimiter(rate.Every(time.Second), 4)
+}
+
+type consumerGroupManager interface {
+	CommitOffset(string, int32, int64) error
+	Create() error
+	Exists() (bool, error)
+	FetchOffset(string, int32) (int64, error)
+	WatchInstances() (kazoo.ConsumergroupInstanceList, <-chan zk.Event, error)
+}
+
 // The ConsumerGroup type holds all the information for a consumer that is part
 // of a consumer group. Call JoinConsumerGroup to start a consumer.
 type ConsumerGroup struct {
 	config *Config
 
-	consumer sarama.Consumer
-	kazoo    *kazoo.Kazoo
-	group    *kazoo.Consumergroup
-	instance *kazoo.ConsumergroupInstance
+	consumer  sarama.Consumer
+	kazoo     *kazoo.Kazoo
+	group     consumerGroupManager
+	groupName string
+	instance  *kazoo.ConsumergroupInstance
 
 	wg             sync.WaitGroup
 	singleShutdown sync.Once
@@ -146,9 +156,10 @@ func JoinConsumerGroup(name string, topics []string, zookeeper []string, config 
 		config:   config,
 		consumer: consumer,
 
-		kazoo:    kz,
-		group:    group,
-		instance: instance,
+		kazoo:     kz,
+		group:     group,
+		groupName: name,
+		instance:  instance,
 
 		messages: make(chan *sarama.ConsumerMessage, config.ChannelBufferSize),
 		errors:   make(chan error, config.ChannelBufferSize),
@@ -162,7 +173,7 @@ func JoinConsumerGroup(name string, topics []string, zookeeper []string, config 
 		_ = kz.Close()
 		return nil, err
 	} else if !exists {
-		cg.Logf("Consumergroup `%s` does not yet exists, creating...\n", cg.group.Name)
+		cg.Logf("Consumergroup `%s` does not yet exists, creating...\n", cg.groupName)
 		if err := cg.group.Create(); err != nil {
 			cg.Logf("FAILED to create consumergroup in Zookeeper: %s!\n", err)
 			_ = consumer.Close()
@@ -240,7 +251,7 @@ func (cg *ConsumerGroup) Logf(format string, args ...interface{}) {
 	} else {
 		identifier = cg.instance.ID[len(cg.instance.ID)-12:]
 	}
-	sarama.Logger.Printf("[%s/%s] %s", cg.group.Name, identifier, fmt.Sprintf(format, args...))
+	sarama.Logger.Printf("[%s/%s] %s", cg.groupName, identifier, fmt.Sprintf(format, args...))
 }
 
 func (cg *ConsumerGroup) InstanceRegistered() (bool, error) {
