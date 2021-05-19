@@ -98,31 +98,7 @@ type ConsumerGroup struct {
 	offsetManager OffsetManager
 }
 
-// Connects to a consumer group, using Zookeeper for auto-discovery
-func JoinConsumerGroup(name string, topics []string, zookeeper []string, config *Config) (cg *ConsumerGroup, err error) {
-
-	if name == "" {
-		return nil, sarama.ConfigurationError("Empty consumergroup name")
-	}
-
-	if len(topics) == 0 {
-		return nil, sarama.ConfigurationError("No topics provided")
-	}
-
-	if len(zookeeper) == 0 {
-		return nil, errors.New("You need to provide at least one zookeeper node address!")
-	}
-
-	if config == nil {
-		config = NewConfig()
-	}
-	config.ClientID = name
-
-	// Validate configuration
-	if err = config.Validate(); err != nil {
-		return
-	}
-
+func DefaultConsumerGroup(name string, topics []string, zookeeper []string, config *Config) (cg *ConsumerGroup, err error) {
 	var kz *kazoo.Kazoo
 	if kz, err = kazoo.NewKazoo(zookeeper, config.Zookeeper); err != nil {
 		return
@@ -186,12 +162,54 @@ func JoinConsumerGroup(name string, topics []string, zookeeper []string, config 
 	if err := cg.instance.Register(topics); err != nil {
 		cg.Logf("FAILED to register consumer instance: %s!\n", err)
 		return nil, err
-	} else {
-		cg.Logf("Consumer instance registered (%s).", cg.instance.ID)
 	}
+
+	cg.Logf("Consumer instance registered (%s).", cg.instance.ID)
 
 	offsetConfig := OffsetManagerConfig{CommitInterval: config.Offsets.CommitInterval}
 	cg.offsetManager = NewZookeeperOffsetManager(cg, &offsetConfig)
+
+	return cg, nil
+}
+
+// Connects to a consumer group, using Zookeeper for auto-discovery
+func JoinConsumerGroup(name string, topics []string, zookeeper []string, config *Config, cgConstructor ...func(string, []string, []string, *Config) (cg *ConsumerGroup, err error)) (cg *ConsumerGroup, err error) {
+	if name == "" {
+		return nil, sarama.ConfigurationError("Empty consumergroup name")
+	}
+
+	if len(topics) == 0 {
+		return nil, sarama.ConfigurationError("No topics provided")
+	}
+
+	if len(zookeeper) == 0 {
+		return nil, errors.New("you need to provide at least one zookeeper node address")
+	}
+
+	if config == nil {
+		config = NewConfig()
+	}
+	config.ClientID = name
+
+	// Validate configuration
+	if err = config.Validate(); err != nil {
+		return
+	}
+
+	switch len(cgConstructor) {
+	case 0:
+		cg, err = DefaultConsumerGroup(name, topics, zookeeper, config)
+		if err != nil {
+			return
+		}
+	case 1:
+		cg, err = cgConstructor[0](name, topics, zookeeper, config)
+		if err != nil {
+			return
+		}
+	default:
+		return nil, errors.New("more than one cgConstructor is not supported")
+	}
 
 	go cg.topicListConsumer(topics)
 
