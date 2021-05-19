@@ -75,16 +75,25 @@ type consumerGroupManager interface {
 	WatchInstances() (kazoo.ConsumergroupInstanceList, <-chan zk.Event, error)
 }
 
+type consumerGroupInstanceManager interface {
+	Deregister() error
+	Register(topics []string) error
+	Registered() (bool, error)
+	ClaimPartition(topic string, partition int32) error
+	ReleasePartition(topic string, partition int32) error
+}
+
 // The ConsumerGroup type holds all the information for a consumer that is part
 // of a consumer group. Call JoinConsumerGroup to start a consumer.
 type ConsumerGroup struct {
 	config *Config
 
-	consumer  sarama.Consumer
-	kazoo     *kazoo.Kazoo
-	group     consumerGroupManager
-	groupName string
-	instance  *kazoo.ConsumergroupInstance
+	consumer   sarama.Consumer
+	kazoo      *kazoo.Kazoo
+	group      consumerGroupManager
+	groupName  string
+	instance   consumerGroupInstanceManager
+	instanceID string
 
 	wg             sync.WaitGroup
 	singleShutdown sync.Once
@@ -132,10 +141,11 @@ func DefaultConsumerGroup(name string, topics []string, zookeeper []string, conf
 		config:   config,
 		consumer: consumer,
 
-		kazoo:     kz,
-		group:     group,
-		groupName: name,
-		instance:  instance,
+		kazoo:      kz,
+		group:      group,
+		groupName:  name,
+		instance:   instance,
+		instanceID: instance.ID,
 
 		messages: make(chan *sarama.ConsumerMessage, config.ChannelBufferSize),
 		errors:   make(chan error, config.ChannelBufferSize),
@@ -164,7 +174,7 @@ func DefaultConsumerGroup(name string, topics []string, zookeeper []string, conf
 		return nil, err
 	}
 
-	cg.Logf("Consumer instance registered (%s).", cg.instance.ID)
+	cg.Logf("Consumer instance registered (%s).", cg.instanceID)
 
 	offsetConfig := OffsetManagerConfig{CommitInterval: config.Offsets.CommitInterval}
 	cg.offsetManager = NewZookeeperOffsetManager(cg, &offsetConfig)
@@ -247,7 +257,7 @@ func (cg *ConsumerGroup) Close() error {
 		if shutdownError = cg.instance.Deregister(); shutdownError != nil {
 			cg.Logf("FAILED deregistering consumer instance: %s!\n", shutdownError)
 		} else {
-			cg.Logf("Deregistered consumer instance %s.\n", cg.instance.ID)
+			cg.Logf("Deregistered consumer instance %s.\n", cg.instanceID)
 		}
 
 		if shutdownError = cg.consumer.Close(); shutdownError != nil {
@@ -267,7 +277,7 @@ func (cg *ConsumerGroup) Logf(format string, args ...interface{}) {
 	if cg.instance == nil {
 		identifier = "(defunct)"
 	} else {
-		identifier = cg.instance.ID[len(cg.instance.ID)-12:]
+		identifier = cg.instanceID[len(cg.instanceID)-12:]
 	}
 	sarama.Logger.Printf("[%s/%s] %s", cg.groupName, identifier, fmt.Sprintf(format, args...))
 }
@@ -339,7 +349,7 @@ func (cg *ConsumerGroup) topicListConsumer(topics []string) {
 				if err != nil {
 					cg.Logf("FAILED to register consumer instance: %s!\n", err)
 				} else {
-					cg.Logf("Consumer instance registered (%s).", cg.instance.ID)
+					cg.Logf("Consumer instance registered (%s).", cg.instanceID)
 				}
 			}
 
@@ -387,7 +397,7 @@ func (cg *ConsumerGroup) topicConsumer(ctx context.Context, cancel context.Cance
 	}
 
 	dividedPartitions := dividePartitionsBetweenConsumers(cg.consumers, partitionLeaders)
-	myPartitions := dividedPartitions[cg.instance.ID]
+	myPartitions := dividedPartitions[cg.instanceID]
 	cg.Logf("%s :: Claiming %d of %d partitions", topic, len(myPartitions), len(partitionLeaders))
 
 	// Consume all the assigned partitions
