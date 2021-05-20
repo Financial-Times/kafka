@@ -83,13 +83,30 @@ type consumerGroupInstanceManager interface {
 	ReleasePartition(topic string, partition int32) error
 }
 
+type zookeeperTopicReader interface {
+	Close() error
+	TopicPartitions(topic string) (kazoo.PartitionList, error)
+}
+
+type zookeeperClient struct {
+	zk *kazoo.Kazoo
+}
+
+func (cl *zookeeperClient) Close() error {
+	return cl.zk.Close()
+}
+
+func (cl *zookeeperClient) TopicPartitions(topic string) (kazoo.PartitionList, error) {
+	return cl.zk.Topic(topic).Partitions()
+}
+
 // The ConsumerGroup type holds all the information for a consumer that is part
 // of a consumer group. Call JoinConsumerGroup to start a consumer.
 type ConsumerGroup struct {
 	config *Config
 
 	consumer   sarama.Consumer
-	kazoo      *kazoo.Kazoo
+	kazoo      zookeeperTopicReader
 	group      consumerGroupManager
 	groupName  string
 	instance   consumerGroupInstanceManager
@@ -141,7 +158,7 @@ func DefaultConsumerGroup(name string, topics []string, zookeeper []string, conf
 		config:   config,
 		consumer: consumer,
 
-		kazoo:      kz,
+		kazoo:      &zookeeperClient{zk: kz},
 		group:      group,
 		groupName:  name,
 		instance:   instance,
@@ -372,7 +389,7 @@ func (cg *ConsumerGroup) topicConsumer(ctx context.Context, cancel context.Cance
 	cg.Logf("%s :: Started topic consumer\n", topic)
 
 	// Fetch a list of partition IDs
-	partitions, err := cg.kazoo.Topic(topic).Partitions()
+	partitions, err := cg.kazoo.TopicPartitions(topic)
 	if err != nil {
 		cg.Logf("%s :: FAILED to get list of partitions: %s\n", topic, err)
 		cg.errors <- &sarama.ConsumerError{
