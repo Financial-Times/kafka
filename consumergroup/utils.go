@@ -10,22 +10,6 @@ import (
 	"github.com/wvanbergen/kazoo-go"
 )
 
-func retrievePartitionLeaders(partitions kazoo.PartitionList) (partitionLeaders, error) {
-
-	pls := make(partitionLeaders, 0, len(partitions))
-	for _, partition := range partitions {
-		leader, err := partition.Leader()
-		if err != nil {
-			return nil, err
-		}
-
-		pl := partitionLeader{id: partition.ID, leader: leader, partition: partition}
-		pls = append(pls, pl)
-	}
-
-	return pls, nil
-}
-
 // Divides a set of partitions between a set of consumers.
 func dividePartitionsBetweenConsumers(consumers kazoo.ConsumergroupInstanceList, partitions partitionLeaders) map[string][]*kazoo.Partition {
 	result := make(map[string][]*kazoo.Partition)

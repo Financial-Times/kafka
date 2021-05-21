@@ -85,6 +85,7 @@ type consumerGroupInstanceManager interface {
 
 type zookeeperTopicReader interface {
 	Close() error
+	RetrievePartitionLeaders(partitions kazoo.PartitionList) (partitionLeaders, error)
 	TopicPartitions(topic string) (kazoo.PartitionList, error)
 }
 
@@ -98,6 +99,21 @@ func (cl *zookeeperClient) Close() error {
 
 func (cl *zookeeperClient) TopicPartitions(topic string) (kazoo.PartitionList, error) {
 	return cl.zk.Topic(topic).Partitions()
+}
+
+func (cl *zookeeperClient) RetrievePartitionLeaders(partitions kazoo.PartitionList) (partitionLeaders, error) {
+	pls := make(partitionLeaders, 0, len(partitions))
+	for _, partition := range partitions {
+		leader, err := partition.Leader()
+		if err != nil {
+			return nil, err
+		}
+
+		pl := partitionLeader{id: partition.ID, leader: leader, partition: partition}
+		pls = append(pls, pl)
+	}
+
+	return pls, nil
 }
 
 // The ConsumerGroup type holds all the information for a consumer that is part
@@ -401,7 +417,7 @@ func (cg *ConsumerGroup) topicConsumer(ctx context.Context, cancel context.Cance
 		return
 	}
 
-	partitionLeaders, err := retrievePartitionLeaders(partitions)
+	topicPartitionLeaders, err := cg.kazoo.RetrievePartitionLeaders(partitions)
 	if err != nil {
 		cg.Logf("%s :: FAILED to get leaders of partitions: %s\n", topic, err)
 		cg.errors <- &sarama.ConsumerError{
@@ -413,9 +429,9 @@ func (cg *ConsumerGroup) topicConsumer(ctx context.Context, cancel context.Cance
 		return
 	}
 
-	dividedPartitions := dividePartitionsBetweenConsumers(cg.consumers, partitionLeaders)
+	dividedPartitions := dividePartitionsBetweenConsumers(cg.consumers, topicPartitionLeaders)
 	myPartitions := dividedPartitions[cg.instanceID]
-	cg.Logf("%s :: Claiming %d of %d partitions", topic, len(myPartitions), len(partitionLeaders))
+	cg.Logf("%s :: Claiming %d of %d partitions", topic, len(myPartitions), len(topicPartitionLeaders))
 
 	// Consume all the assigned partitions
 	var wg sync.WaitGroup
