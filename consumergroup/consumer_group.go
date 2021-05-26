@@ -129,6 +129,7 @@ type ConsumerGroup struct {
 	instance   consumerGroupInstanceManager
 	instanceID string
 
+	mu             sync.Mutex
 	wg             sync.WaitGroup
 	singleShutdown sync.Once
 
@@ -281,7 +282,11 @@ func (cg *ConsumerGroup) Close() error {
 
 		shutdownError = nil
 
+		// Wait for the cg.topicConsumer() initial setup if it is started
+		cg.mu.Lock()
 		close(cg.stopper)
+		cg.mu.Unlock()
+
 		cg.wg.Wait()
 
 		if err := cg.offsetManager.Close(); err != nil {
@@ -336,11 +341,11 @@ func (cg *ConsumerGroup) topicListConsumer(topics []string) {
 		// This has to happen before checking the cg.stopper channel because otherwise
 		// the select may be executed before the cg.wg.Wait() in cg.Close() and
 		// the resource cleanup will continue while we are tring to modify the resources (and a panic may occur)
-		cg.wg.Add(1)
+		cg.mu.Lock()
 
 		select {
 		case <-cg.stopper:
-			cg.wg.Done()
+			cg.mu.Unlock()
 			return
 		default:
 		}
@@ -351,8 +356,8 @@ func (cg *ConsumerGroup) topicListConsumer(topics []string) {
 		consumers, consumerChanges, err := cg.group.WatchInstances()
 		if err != nil {
 			cg.Logf("FAILED to get list of registered consumer instances: %s\n", err)
-			cg.wg.Done()
 			cancel()
+			cg.mu.Unlock()
 			return
 		}
 
@@ -365,7 +370,7 @@ func (cg *ConsumerGroup) topicListConsumer(topics []string) {
 		}
 
 		// Ensure that we wait for the cg.topicConsumer() Go routines to complete in cg.Close()
-		cg.wg.Done()
+		cg.mu.Unlock()
 
 		select {
 		case <-ctx.Done():
