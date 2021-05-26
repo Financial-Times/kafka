@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"sync"
 	"time"
 
@@ -370,6 +371,13 @@ func (cg *ConsumerGroup) topicListConsumer(topics []string) {
 		case <-ctx.Done():
 			cg.wg.Wait()
 		case <-cg.stopper:
+			// A race condition between this method and cg.Close() may occur
+			// if the cg.stopper channel is closed before this select.
+			// To ensure that the order of events is the one that causes the panic condition
+			// we are adding a small sleep when the code is executed via the TestStartCloseRace() test.
+			if os.Getenv("TESTING_FAILURE_INJECTION") == "1" {
+				time.Sleep(1 * time.Millisecond)
+			}
 			cancel()
 			return
 
@@ -436,7 +444,6 @@ func (cg *ConsumerGroup) topicConsumer(ctx context.Context, cancel context.Cance
 	// Consume all the assigned partitions
 	var wg sync.WaitGroup
 	for _, pid := range myPartitions {
-
 		wg.Add(1)
 		go cg.partitionConsumer(ctx, topic, pid.ID, messages, errors, &wg)
 	}
