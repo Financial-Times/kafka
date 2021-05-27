@@ -1,5 +1,8 @@
 # kafka
 
+[![CircleCI](https://circleci.com/gh/Financial-Times/kafka.svg?style=svg)](https://circleci.com/gh/Financial-Times/kafka)
+[![Coverage Status](https://coveralls.io/repos/github/Financial-Times/kafka/badge.svg?branch=master)](https://coveralls.io/github/Financial-Times/kafka?branch=master)
+
 Kafka libraries, tools and example applications built on top of the
 [sarama](https://github.com/Shopify/sarama) package.
 
