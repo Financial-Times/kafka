@@ -153,7 +153,6 @@ func DefaultConsumerGroup(name string, topics []string, zookeeper []string, conf
 		kz.Close()
 		return
 	}
-
 	group := kz.Consumergroup(name)
 
 	if config.Offsets.ResetOffsets {
@@ -164,7 +163,12 @@ func DefaultConsumerGroup(name string, topics []string, zookeeper []string, conf
 		}
 	}
 
-	instance := group.NewInstance()
+	id, err := generateConsumerInstanceID()
+	if err != nil {
+		kz.Close()
+		return
+	}
+	instance := group.Instance(id)
 
 	var consumer sarama.Consumer
 	if consumer, err = sarama.NewConsumer(brokers, config.Config); err != nil {
