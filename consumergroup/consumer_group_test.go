@@ -1,9 +1,12 @@
+// +build integration
+
 package consumergroup
 
 import (
 	"fmt"
-	"github.com/wvanbergen/kazoo-go"
 	"testing"
+
+	"github.com/wvanbergen/kazoo-go"
 )
 
 func createTestConsumerGroupInstanceList(size int) kazoo.ConsumergroupInstanceList {

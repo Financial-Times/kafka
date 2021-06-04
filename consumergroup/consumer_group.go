@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"sync"
 	"time"
 
 	"github.com/Shopify/sarama"
+	"github.com/samuel/go-zookeeper/zk"
 	"github.com/wvanbergen/kazoo-go"
 	"golang.org/x/time/rate"
 )
@@ -40,10 +42,6 @@ func NewConfig() *Config {
 	return config
 }
 
-func newDefaultLimiter() *rate.Limiter {
-	return rate.NewLimiter(rate.Every(time.Second), 4)
-}
-
 func (cgc *Config) Validate() error {
 	if cgc.Zookeeper.Timeout <= 0 {
 		return sarama.ConfigurationError("ZookeeperTimeout should have a duration > 0")
@@ -66,18 +64,73 @@ func (cgc *Config) Validate() error {
 	return nil
 }
 
+func newDefaultLimiter() *rate.Limiter {
+	return rate.NewLimiter(rate.Every(time.Second), 4)
+}
+
+type consumerGroupManager interface {
+	CommitOffset(string, int32, int64) error
+	Create() error
+	Exists() (bool, error)
+	FetchOffset(string, int32) (int64, error)
+	WatchInstances() (kazoo.ConsumergroupInstanceList, <-chan zk.Event, error)
+}
+
+type consumerGroupInstanceManager interface {
+	Deregister() error
+	Register(topics []string) error
+	Registered() (bool, error)
+	ClaimPartition(topic string, partition int32) error
+	ReleasePartition(topic string, partition int32) error
+}
+
+type zookeeperTopicReader interface {
+	Close() error
+	RetrievePartitionLeaders(partitions kazoo.PartitionList) (partitionLeaders, error)
+	TopicPartitions(topic string) (kazoo.PartitionList, error)
+}
+
+type zookeeperClient struct {
+	zk *kazoo.Kazoo
+}
+
+func (cl *zookeeperClient) Close() error {
+	return cl.zk.Close()
+}
+
+func (cl *zookeeperClient) TopicPartitions(topic string) (kazoo.PartitionList, error) {
+	return cl.zk.Topic(topic).Partitions()
+}
+
+func (cl *zookeeperClient) RetrievePartitionLeaders(partitions kazoo.PartitionList) (partitionLeaders, error) {
+	pls := make(partitionLeaders, 0, len(partitions))
+	for _, partition := range partitions {
+		leader, err := partition.Leader()
+		if err != nil {
+			return nil, err
+		}
+
+		pl := partitionLeader{id: partition.ID, leader: leader, partition: partition}
+		pls = append(pls, pl)
+	}
+
+	return pls, nil
+}
+
 // The ConsumerGroup type holds all the information for a consumer that is part
 // of a consumer group. Call JoinConsumerGroup to start a consumer.
 type ConsumerGroup struct {
 	config *Config
 
-	consumer sarama.Consumer
-	kazoo    *kazoo.Kazoo
-	group    *kazoo.Consumergroup
-	instance *kazoo.ConsumergroupInstance
+	consumer   sarama.Consumer
+	kazoo      zookeeperTopicReader
+	group      consumerGroupManager
+	groupName  string
+	instance   consumerGroupInstanceManager
+	instanceID string
 
+	mu             sync.Mutex
 	wg             sync.WaitGroup
-	nGoroutines    int
 	singleShutdown sync.Once
 
 	messages chan *sarama.ConsumerMessage
@@ -89,35 +142,7 @@ type ConsumerGroup struct {
 	offsetManager OffsetManager
 }
 
-func (cg *ConsumerGroup) existInstance() bool {
-	return cg.instance != nil
-}
-
-// Connects to a consumer group, using Zookeeper for auto-discovery
-func JoinConsumerGroup(name string, topics []string, zookeeper []string, config *Config) (cg *ConsumerGroup, err error) {
-
-	if name == "" {
-		return nil, sarama.ConfigurationError("Empty consumergroup name")
-	}
-
-	if len(topics) == 0 {
-		return nil, sarama.ConfigurationError("No topics provided")
-	}
-
-	if len(zookeeper) == 0 {
-		return nil, errors.New("You need to provide at least one zookeeper node address!")
-	}
-
-	if config == nil {
-		config = NewConfig()
-	}
-	config.ClientID = name
-
-	// Validate configuration
-	if err = config.Validate(); err != nil {
-		return
-	}
-
+func DefaultConsumerGroup(name string, topics []string, zookeeper []string, config *Config) (cg *ConsumerGroup, err error) {
 	var kz *kazoo.Kazoo
 	if kz, err = kazoo.NewKazoo(zookeeper, config.Zookeeper); err != nil {
 		return
@@ -128,7 +153,6 @@ func JoinConsumerGroup(name string, topics []string, zookeeper []string, config 
 		kz.Close()
 		return
 	}
-
 	group := kz.Consumergroup(name)
 
 	if config.Offsets.ResetOffsets {
@@ -139,7 +163,12 @@ func JoinConsumerGroup(name string, topics []string, zookeeper []string, config 
 		}
 	}
 
-	instance := group.NewInstance()
+	id, err := generateConsumerInstanceID()
+	if err != nil {
+		kz.Close()
+		return
+	}
+	instance := group.Instance(id)
 
 	var consumer sarama.Consumer
 	if consumer, err = sarama.NewConsumer(brokers, config.Config); err != nil {
@@ -151,9 +180,11 @@ func JoinConsumerGroup(name string, topics []string, zookeeper []string, config 
 		config:   config,
 		consumer: consumer,
 
-		kazoo:    kz,
-		group:    group,
-		instance: instance,
+		kazoo:      &zookeeperClient{zk: kz},
+		group:      group,
+		groupName:  name,
+		instance:   instance,
+		instanceID: instance.ID,
 
 		messages: make(chan *sarama.ConsumerMessage, config.ChannelBufferSize),
 		errors:   make(chan error, config.ChannelBufferSize),
@@ -167,7 +198,7 @@ func JoinConsumerGroup(name string, topics []string, zookeeper []string, config 
 		_ = kz.Close()
 		return nil, err
 	} else if !exists {
-		cg.Logf("Consumergroup `%s` does not yet exists, creating...\n", cg.group.Name)
+		cg.Logf("Consumergroup `%s` does not yet exists, creating...\n", cg.groupName)
 		if err := cg.group.Create(); err != nil {
 			cg.Logf("FAILED to create consumergroup in Zookeeper: %s!\n", err)
 			_ = consumer.Close()
@@ -177,17 +208,57 @@ func JoinConsumerGroup(name string, topics []string, zookeeper []string, config 
 	}
 
 	// Register itself with zookeeper
-	if cg.existInstance() {
-		if err := cg.instance.Register(topics); err != nil {
-			cg.Logf("FAILED to register consumer instance: %s!\n", err)
-			return nil, err
-		} else {
-			cg.Logf("Consumer instance registered (%s).", cg.instance.ID)
-		}
+	if err := cg.instance.Register(topics); err != nil {
+		cg.Logf("FAILED to register consumer instance: %s!\n", err)
+		return nil, err
 	}
+
+	cg.Logf("Consumer instance registered (%s).", cg.instanceID)
 
 	offsetConfig := OffsetManagerConfig{CommitInterval: config.Offsets.CommitInterval}
 	cg.offsetManager = NewZookeeperOffsetManager(cg, &offsetConfig)
+
+	return cg, nil
+}
+
+// Connects to a consumer group, using Zookeeper for auto-discovery
+func JoinConsumerGroup(name string, topics []string, zookeeper []string, config *Config, cgConstructor ...func(string, []string, []string, *Config) (cg *ConsumerGroup, err error)) (cg *ConsumerGroup, err error) {
+	if name == "" {
+		return nil, sarama.ConfigurationError("Empty consumergroup name")
+	}
+
+	if len(topics) == 0 {
+		return nil, sarama.ConfigurationError("No topics provided")
+	}
+
+	if len(zookeeper) == 0 {
+		return nil, errors.New("you need to provide at least one zookeeper node address")
+	}
+
+	if config == nil {
+		config = NewConfig()
+	}
+	config.ClientID = name
+
+	// Validate configuration
+	if err = config.Validate(); err != nil {
+		return
+	}
+
+	switch len(cgConstructor) {
+	case 0:
+		cg, err = DefaultConsumerGroup(name, topics, zookeeper, config)
+		if err != nil {
+			return
+		}
+	case 1:
+		cg, err = cgConstructor[0](name, topics, zookeeper, config)
+		if err != nil {
+			return
+		}
+	default:
+		return nil, errors.New("more than one cgConstructor is not supported")
+	}
 
 	go cg.topicListConsumer(topics)
 
@@ -215,25 +286,27 @@ func (cg *ConsumerGroup) Close() error {
 
 		shutdownError = nil
 
+		// Wait for the cg.topicConsumer() initial setup if it is started
+		cg.mu.Lock()
 		close(cg.stopper)
+		cg.mu.Unlock()
+
 		cg.wg.Wait()
 
 		if err := cg.offsetManager.Close(); err != nil {
 			cg.Logf("FAILED closing the offset manager: %s!\n", err)
 		}
 
-		if cg.existInstance() {
-			if shutdownError = cg.instance.Deregister(); shutdownError != nil {
-				cg.Logf("FAILED deregistering consumer instance: %s!\n", shutdownError)
-			} else {
-				cg.Logf("Deregistered consumer instance %s.\n", cg.instance.ID)
-			}
+		if shutdownError = cg.instance.Deregister(); shutdownError != nil {
+			cg.Logf("FAILED deregistering consumer instance: %s!\n", shutdownError)
+		} else {
+			cg.Logf("Deregistered consumer instance %s.\n", cg.instanceID)
 		}
+
 		if shutdownError = cg.consumer.Close(); shutdownError != nil {
 			cg.Logf("FAILED closing the Sarama client: %s\n", shutdownError)
 		}
 
-		cg.Logf("closing cg channels and instance, remaining goroutines: %d\n", cg.nGoroutines)
 		close(cg.messages)
 		close(cg.errors)
 		cg.instance = nil
@@ -247,16 +320,13 @@ func (cg *ConsumerGroup) Logf(format string, args ...interface{}) {
 	if cg.instance == nil {
 		identifier = "(defunct)"
 	} else {
-			identifier = cg.instance.ID[len(cg.instance.ID)-12:]
+		identifier = cg.instanceID[len(cg.instanceID)-12:]
 	}
-	sarama.Logger.Printf("[%s/%s] %s", cg.group.Name, identifier, fmt.Sprintf(format, args...))
+	sarama.Logger.Printf("[%s/%s] %s", cg.groupName, identifier, fmt.Sprintf(format, args...))
 }
 
 func (cg *ConsumerGroup) InstanceRegistered() (bool, error) {
-	if cg.existInstance() {
-		return cg.instance.Registered()
-	}
-	return false, errors.New("instance has nil value")
+	return cg.instance.Registered()
 }
 
 func (cg *ConsumerGroup) CommitUpto(message *sarama.ConsumerMessage) error {
@@ -271,9 +341,15 @@ func (cg *ConsumerGroup) FlushOffsets() error {
 func (cg *ConsumerGroup) topicListConsumer(topics []string) {
 	limiter := newDefaultLimiter()
 	for {
-		// note whats the purpose of this being here when is called at the bottom of the for
+		// Ensure that we wait for the cg.topicConsumer() Go routines to complete in cg.Close()
+		// This has to happen before checking the cg.stopper channel because otherwise
+		// the select may be executed before the cg.wg.Wait() in cg.Close() and
+		// the resource cleanup will continue while we are tring to modify the resources (and a panic may occur)
+		cg.mu.Lock()
+
 		select {
 		case <-cg.stopper:
+			cg.mu.Unlock()
 			return
 		default:
 		}
@@ -285,6 +361,7 @@ func (cg *ConsumerGroup) topicListConsumer(topics []string) {
 		if err != nil {
 			cg.Logf("FAILED to get list of registered consumer instances: %s\n", err)
 			cancel()
+			cg.mu.Unlock()
 			return
 		}
 
@@ -293,32 +370,36 @@ func (cg *ConsumerGroup) topicListConsumer(topics []string) {
 
 		for _, topic := range topics {
 			cg.wg.Add(1)
-			cg.nGoroutines += 1
 			go cg.topicConsumer(ctx, cancel, topic, cg.messages, cg.errors)
 		}
-		//note let's just wait here for test instead:
-		cg.wg.Wait()
 
-		// note why does not wait here ! right after ! what if enters cg.stopper ?
+		// Ensure that we wait for the cg.topicConsumer() Go routines to complete in cg.Close()
+		cg.mu.Unlock()
+
 		select {
 		case <-ctx.Done():
 			cg.wg.Wait()
 		case <-cg.stopper:
+			// A race condition between this method and cg.Close() may occur
+			// if the cg.stopper channel is closed before this select.
+			// To ensure that the order of events is the one that causes the panic condition
+			// we are adding a small sleep when the code is executed via the TestStartCloseRace() test.
+			if os.Getenv("TESTING_FAILURE_INJECTION") == "1" {
+				time.Sleep(1 * time.Millisecond)
+			}
 			cancel()
 			return
 
 		case <-consumerChanges:
-			if cg.existInstance() {
-				registered, err := cg.instance.Registered()
+			registered, err := cg.instance.Registered()
+			if err != nil {
+				cg.Logf("FAILED to get register status: %s\n", err)
+			} else if !registered {
+				err = cg.instance.Register(topics)
 				if err != nil {
-					cg.Logf("FAILED to get register status: %s\n", err)
-				} else if !registered {
-					err = cg.instance.Register(topics)
-					if err != nil {
-						cg.Logf("FAILED to register consumer instance: %s!\n", err)
-					} else {
-						cg.Logf("Consumer instance registered (%s).", cg.instance.ID)
-					}
+					cg.Logf("FAILED to register consumer instance: %s!\n", err)
+				} else {
+					cg.Logf("Consumer instance registered (%s).", cg.instanceID)
 				}
 			}
 
@@ -330,12 +411,7 @@ func (cg *ConsumerGroup) topicListConsumer(topics []string) {
 }
 
 func (cg *ConsumerGroup) topicConsumer(ctx context.Context, cancel context.CancelFunc, topic string, messages chan<- *sarama.ConsumerMessage, errors chan<- error) {
-	defer func() {
-		// todo lock
-		cg.nGoroutines -= 1
-		// todo unlock
-		cg.wg.Done()
-	}()
+	defer cg.wg.Done()
 
 	select {
 	case <-ctx.Done():
@@ -346,48 +422,37 @@ func (cg *ConsumerGroup) topicConsumer(ctx context.Context, cancel context.Cance
 	cg.Logf("%s :: Started topic consumer\n", topic)
 
 	// Fetch a list of partition IDs
-	partitions, err := cg.kazoo.Topic(topic).Partitions()
+	partitions, err := cg.kazoo.TopicPartitions(topic)
 	if err != nil {
 		cg.Logf("%s :: FAILED to get list of partitions: %s\n", topic, err)
-
-		_, ok := <-cg.errors
-		if ok {
-			cg.errors <- &sarama.ConsumerError{
-				Topic:     topic,
-				Partition: -1,
-				Err:       err,
-			}
+		cg.errors <- &sarama.ConsumerError{
+			Topic:     topic,
+			Partition: -1,
+			Err:       err,
 		}
 		cancel()
 		return
 	}
 
-	partitionLeaders, err := retrievePartitionLeaders(partitions)
+	topicPartitionLeaders, err := cg.kazoo.RetrievePartitionLeaders(partitions)
 	if err != nil {
-		_, ok := <-cg.errors
-		if ok {
-			cg.Logf("%s :: FAILED to get leaders of partitions: %s\n", topic, err)
-			cg.errors <- &sarama.ConsumerError{
-				Topic:     topic,
-				Partition: -1,
-				Err:       err,
-			}
+		cg.Logf("%s :: FAILED to get leaders of partitions: %s\n", topic, err)
+		cg.errors <- &sarama.ConsumerError{
+			Topic:     topic,
+			Partition: -1,
+			Err:       err,
 		}
 		cancel()
 		return
 	}
 
-	dividedPartitions := dividePartitionsBetweenConsumers(cg.consumers, partitionLeaders)
-	var myPartitions []*kazoo.Partition
-	if cg.existInstance() {
-		myPartitions = dividedPartitions[cg.instance.ID]
-	}
-	cg.Logf("%s :: Claiming %d of %d partitions", topic, len(myPartitions), len(partitionLeaders))
+	dividedPartitions := dividePartitionsBetweenConsumers(cg.consumers, topicPartitionLeaders)
+	myPartitions := dividedPartitions[cg.instanceID]
+	cg.Logf("%s :: Claiming %d of %d partitions", topic, len(myPartitions), len(topicPartitionLeaders))
 
 	// Consume all the assigned partitions
 	var wg sync.WaitGroup
 	for _, pid := range myPartitions {
-
 		wg.Add(1)
 		go cg.partitionConsumer(ctx, topic, pid.ID, messages, errors, &wg)
 	}
@@ -435,47 +500,35 @@ partitionClaimLoop:
 		case <-ctx.Done():
 			return
 		case <-time.After(1 * time.Second):
-			if cg.existInstance() {
-				if err := cg.instance.ClaimPartition(topic, partition); err == nil {
-					break partitionClaimLoop
-				} else if tries+1 < maxRetries {
-					if err == kazoo.ErrPartitionClaimedByOther {
-						// Another consumer still owns this partition. We should wait longer for it to release it.
-					} else {
-						// An unexpected error occurred. Log it and continue trying until we hit the timeout.
-						cg.Logf("%s/%d :: FAILED to claim partition on attempt %v of %v; retrying in 1 second. Error: %v", topic, partition, tries+1, maxRetries, err)
-					}
+			if err := cg.instance.ClaimPartition(topic, partition); err == nil {
+				break partitionClaimLoop
+			} else if tries+1 < maxRetries {
+				if err == kazoo.ErrPartitionClaimedByOther {
+					// Another consumer still owns this partition. We should wait longer for it to release it.
 				} else {
-					cg.Logf("%s/%d :: FAILED to claim the partition: %s\n", topic, partition, err)
-					_, ok := <-cg.errors
-					if ok {
-						cg.Logf("%s :: FAILED to get leaders of partitions: %s\n", topic, err)
-						cg.errors <- &sarama.ConsumerError{
-							Topic:     topic,
-							Partition: -1,
-							Err:       err,
-						}
-					}
-					return
+					// An unexpected error occurred. Log it and continue trying until we hit the timeout.
+					cg.Logf("%s/%d :: FAILED to claim partition on attempt %v of %v; retrying in 1 second. Error: %v", topic, partition, tries+1, maxRetries, err)
 				}
+			} else {
+				cg.Logf("%s/%d :: FAILED to claim the partition: %s\n", topic, partition, err)
+				cg.errors <- &sarama.ConsumerError{
+					Topic:     topic,
+					Partition: partition,
+					Err:       err,
+				}
+				return
 			}
 		}
 	}
 
 	defer func() {
-		if cg.existInstance() {
-			err := cg.instance.ReleasePartition(topic, partition)
-			if err != nil {
-				cg.Logf("%s/%d :: FAILED to release partition: %s\n", topic, partition, err)
-				_, ok := <-cg.errors
-				if ok {
-					cg.Logf("%s :: FAILED to get leaders of partitions: %s\n", topic, err)
-					cg.errors <- &sarama.ConsumerError{
-						Topic:     topic,
-						Partition: -1,
-						Err:       err,
-					}
-				}
+		err := cg.instance.ReleasePartition(topic, partition)
+		if err != nil {
+			cg.Logf("%s/%d :: FAILED to release partition: %s\n", topic, partition, err)
+			cg.errors <- &sarama.ConsumerError{
+				Topic:     topic,
+				Partition: partition,
+				Err:       err,
 			}
 		}
 	}()

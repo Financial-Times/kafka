@@ -10,22 +10,6 @@ import (
 	"github.com/wvanbergen/kazoo-go"
 )
 
-func retrievePartitionLeaders(partitions kazoo.PartitionList) (partitionLeaders, error) {
-
-	pls := make(partitionLeaders, 0, len(partitions))
-	for _, partition := range partitions {
-		leader, err := partition.Leader()
-		if err != nil {
-			return nil, err
-		}
-
-		pl := partitionLeader{id: partition.ID, leader: leader, partition: partition}
-		pls = append(pls, pl)
-	}
-
-	return pls, nil
-}
-
 // Divides a set of partitions between a set of consumers.
 func dividePartitionsBetweenConsumers(consumers kazoo.ConsumergroupInstanceList, partitions partitionLeaders) map[string][]*kazoo.Partition {
 	result := make(map[string][]*kazoo.Partition)
@@ -82,6 +66,7 @@ func (s partitionLeaders) Swap(i, j int) {
 	s[i], s[j] = s[j], s[i]
 }
 
+// generateUUID Generates a UUIDv4.
 func generateUUID() (string, error) {
 	uuid := make([]byte, 16)
 	n, err := io.ReadFull(rand.Reader, uuid)
@@ -95,19 +80,18 @@ func generateUUID() (string, error) {
 	return fmt.Sprintf("%x-%x-%x-%x-%x", uuid[0:4], uuid[4:6], uuid[6:8], uuid[8:10], uuid[10:]), nil
 }
 
-func generateConsumerID() (consumerID string, err error) {
-	var uuid, hostname string
-
-	uuid, err = generateUUID()
+// generateConsumerInstanceID generates a consumergroup Instance ID
+// that is almost certain to be unique.
+func generateConsumerInstanceID() (string, error) {
+	uuid, err := generateUUID()
 	if err != nil {
-		return
+		return "", err
 	}
 
-	hostname, err = os.Hostname()
+	hostname, err := os.Hostname()
 	if err != nil {
-		return
+		return "", err
 	}
 
-	consumerID = fmt.Sprintf("%s:%s", hostname, uuid)
-	return
+	return fmt.Sprintf("%s:%s", hostname, uuid), nil
 }
