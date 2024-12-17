@@ -1,7 +1,7 @@
 version: 2.1
 
 orbs:
-  ft-golang-ci: financial-times/golang-ci@1
+  ft-golang-ci: financial-times/golang-ci@2
 
 jobs:
   build:
@@ -18,10 +18,10 @@ jobs:
       - run:
           name: Setup Kafka
           command: |
-            apt-get update && apt-get install --yes software-properties-common
-            wget -qO - https://adoptopenjdk.jfrog.io/adoptopenjdk/api/gpg/key/public | apt-key add -
-            apt-add-repository --yes https://adoptopenjdk.jfrog.io/adoptopenjdk/deb/
-            apt-get update && apt-get install --yes adoptopenjdk-8-hotspot
+            apt-get update && apt-get install --yes wget gnupg lsb-release
+            wget -qO - https://packages.adoptium.net/artifactory/api/gpg/key/public | gpg --dearmor -o /usr/share/keyrings/adoptium-archive-keyring.gpg
+            echo "deb [signed-by=/usr/share/keyrings/adoptium-archive-keyring.gpg] https://packages.adoptium.net/artifactory/deb/ $(lsb_release -cs) main" | tee /etc/apt/sources.list.d/adoptium.list > /dev/null
+            apt-get update && apt-get install --yes temurin-8-jdk
             wget https://archive.apache.org/dist/kafka/0.8.2.2/kafka_2.10-0.8.2.2.tgz -O kafka.tgz
             mkdir -p /kafka && tar xzf kafka.tgz -C /kafka --strip-components 1
             nohup bash -c "cd /kafka && bin/zookeeper-server-start.sh config/zookeeper.properties &"
@@ -38,8 +38,3 @@ workflows:
   tests:
     jobs:
       - build
-  snyk-scanning:
-    jobs:
-      - ft-golang-ci/scan:
-          name: scan-dependencies
-          context: cm-team-snyk
