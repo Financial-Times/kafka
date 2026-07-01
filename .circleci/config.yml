@@ -7,7 +7,7 @@ jobs:
   build:
     working_directory: /kafka-lib
     docker:
-      - image: golang:1
+      - image: golang:1.26
         environment:
           CIRCLE_TEST_REPORTS: /tmp/test-results
           CIRCLE_COVERAGE_REPORT: /tmp/coverage-results
