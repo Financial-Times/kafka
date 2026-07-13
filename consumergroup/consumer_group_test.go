@@ -1,9 +1,11 @@
+//go:build integration
 // +build integration
 
 package consumergroup
 
 import (
 	"fmt"
+	"math"
 	"testing"
 
 	"github.com/wvanbergen/kazoo-go"
@@ -18,20 +20,27 @@ func createTestConsumerGroupInstanceList(size int) kazoo.ConsumergroupInstanceLi
 }
 
 func createTestPartitions(count int) []partitionLeader {
+	if count < 0 || count > math.MaxInt32 {
+		panic("partition count exceeds int32 range") // satisfy linter check
+	}
+
 	p := make([]partitionLeader, count)
+	var partitionID int32
 	for i := range p {
-		p[i] = partitionLeader{id: int32(i), leader: 1, partition: &kazoo.Partition{ID: int32(i)}}
+		p[i] = partitionLeader{id: partitionID, leader: 1, partition: &kazoo.Partition{ID: partitionID}}
+		partitionID++
 	}
 	return p
 }
 
+// nolint:gocognit
 func Test_PartitionDivision(t *testing.T) {
+	// {number of Consumers, number of Partitions}
 	consumerPartitionTestCases := [][2]int{
-		// {number of Consumers, number of Partitions}
-		[2]int{2, 5},
-		[2]int{5, 2},
-		[2]int{9, 32},
-		[2]int{10, 50},
+		{2, 5},
+		{5, 2},
+		{9, 32},
+		{10, 50},
 	}
 	for _, v := range consumerPartitionTestCases {
 		consumers := createTestConsumerGroupInstanceList(v[0])
