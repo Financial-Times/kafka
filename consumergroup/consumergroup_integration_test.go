@@ -73,7 +73,10 @@ func ExampleConsumerGroup() {
 		eventCount += 1
 
 		// Ack event
-		consumer.CommitUpto(event)
+		if err := consumer.CommitUpto(event); err != nil {
+			log.Printf("failed to commit event: %v", err)
+			return
+		}
 	}
 
 	log.Printf("Processed %d events.", eventCount)
@@ -84,13 +87,29 @@ func ExampleConsumerGroup() {
 ////////////////////////////////////////////////////////////////////
 
 func TestIntegrationMultipleTopicsSingleConsumer(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
 	consumerGroup := "TestIntegrationMultipleTopicsSingleConsumer"
 	setupZookeeper(t, consumerGroup, TopicWithSinglePartition, 1)
 	setupZookeeper(t, consumerGroup, TopicWithMultiplePartitions, 4)
 
 	// Produce 100 events that we will consume
-	go produceEvents(t, consumerGroup, TopicWithSinglePartition, 100)
-	go produceEvents(t, consumerGroup, TopicWithMultiplePartitions, 200)
+	producerErrors := make(chan error, 2)
+	go func() {
+		producerErrors <- produceEvents(TopicWithSinglePartition, 100)
+	}()
+	go func() {
+		producerErrors <- produceEvents(TopicWithMultiplePartitions, 200)
+	}()
+
+	// Check production before waiting for 300 consumed messages.
+	for range 2 {
+		if err := <-producerErrors; err != nil {
+			t.Fatalf("failed to produce events: %v", err)
+		}
+	}
 
 	consumer, err := JoinConsumerGroup(consumerGroup, []string{TopicWithSinglePartition, TopicWithMultiplePartitions}, zookeeperPeers, nil)
 	if err != nil {
@@ -102,10 +121,18 @@ func TestIntegrationMultipleTopicsSingleConsumer(t *testing.T) {
 	assertEvents(t, consumer, 300, offsets)
 }
 
+// nolint:gocognit
 func TestIntegrationSingleTopicParallelConsumers(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
 	consumerGroup := "TestIntegrationSingleTopicParallelConsumers"
 	setupZookeeper(t, consumerGroup, TopicWithMultiplePartitions, 4)
-	go produceEvents(t, consumerGroup, TopicWithMultiplePartitions, 200)
+
+	producerError := make(chan error, 1)
+	go func() {
+		producerError <- produceEvents(TopicWithMultiplePartitions, 200)
+	}()
 
 	consumer1, err := JoinConsumerGroup(consumerGroup, []string{TopicWithMultiplePartitions}, zookeeperPeers, nil)
 	if err != nil {
@@ -118,6 +145,10 @@ func TestIntegrationSingleTopicParallelConsumers(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer consumer2.Close()
+
+	if err := <-producerError; err != nil {
+		t.Fatalf("failed to produce events: %v", err)
+	}
 
 	var eventCount1, eventCount2 int64
 	offsets := make(map[int32]int64)
@@ -144,13 +175,17 @@ func TestIntegrationSingleTopicParallelConsumers(t *testing.T) {
 
 		case event1, ok1 := <-events1:
 			handleEvent(event1, ok1)
+			if err := consumer1.CommitUpto(event1); err != nil {
+				t.Fatalf("consumer1 failed to commit event: %v", err)
+			}
 			eventCount1 += 1
-			consumer1.CommitUpto(event1)
 
 		case event2, ok2 := <-events2:
 			handleEvent(event2, ok2)
+			if err := consumer2.CommitUpto(event2); err != nil {
+				t.Fatalf("consumer2 failed to commit event: %v", err)
+			}
 			eventCount2 += 1
-			consumer2.CommitUpto(event2)
 		}
 	}
 
@@ -164,7 +199,11 @@ func TestIntegrationSingleTopicParallelConsumers(t *testing.T) {
 func TestSingleTopicSequentialConsumer(t *testing.T) {
 	consumerGroup := "TestSingleTopicSequentialConsumer"
 	setupZookeeper(t, consumerGroup, TopicWithSinglePartition, 1)
-	go produceEvents(t, consumerGroup, TopicWithSinglePartition, 20)
+
+	producerError := make(chan error, 1)
+	go func() {
+		producerError <- produceEvents(TopicWithSinglePartition, 20)
+	}()
 
 	offsets := make(OffsetMap)
 
@@ -189,6 +228,10 @@ func TestSingleTopicSequentialConsumer(t *testing.T) {
 
 	assertEvents(t, consumer2, 10, offsets)
 	consumer2.Close()
+
+	if err := <-producerError; err != nil {
+		t.Fatalf("failed to produce events: %v", err)
+	}
 }
 
 ////////////////////////////////////////////////////////////////////
@@ -197,7 +240,9 @@ func TestSingleTopicSequentialConsumer(t *testing.T) {
 
 type OffsetMap map[string]map[int32]int64
 
+// nolint:gocognit
 func assertEvents(t *testing.T, cg *ConsumerGroup, count int64, offsets OffsetMap) {
+	t.Helper()
 	var processed int64
 	for processed < count {
 		select {
@@ -213,20 +258,21 @@ func assertEvents(t *testing.T, cg *ConsumerGroup, count int64, offsets OffsetMa
 				if offsets[message.Topic] == nil {
 					offsets[message.Topic] = make(map[int32]int64)
 				}
-				if offsets[message.Topic][message.Partition] != 0 && offsets[message.Topic][message.Partition]+1 != message.Offset {
-					t.Fatalf("Unexpected offset on %s/%d. Expected %d, got %d.", message.Topic, message.Partition, offsets[message.Topic][message.Partition]+1, message.Offset)
+				previousOffset := offsets[message.Topic][message.Partition]
+				if previousOffset != 0 && previousOffset+1 != message.Offset {
+					t.Fatalf("Unexpected offset on %s/%d. Expected %d, got %d.", message.Topic, message.Partition, previousOffset+1, message.Offset)
 				}
 
-				processed += 1
 				offsets[message.Topic][message.Partition] = message.Offset
-
-				if os.Getenv("DEBUG") != "" {
-					log.Printf("Consumed %d from %s/%d\n", message.Offset, message.Topic, message.Partition)
-				}
-
-				cg.CommitUpto(message)
+			}
+			if os.Getenv("DEBUG") != "" {
+				log.Printf("Consumed %d from %s/%d\n", message.Offset, message.Topic, message.Partition)
 			}
 
+			if err := cg.CommitUpto(message); err != nil {
+				t.Fatalf("failed to commit message: %v", err)
+			}
+			processed += 1
 		}
 	}
 	t.Logf("Successfully asserted %d events.", count)
@@ -240,7 +286,7 @@ func saramaClient() sarama.Client {
 	return client
 }
 
-func produceEvents(t *testing.T, consumerGroup string, topic string, amount int64) error {
+func produceEvents(topic string, amount int64) error {
 	producer, err := sarama.NewSyncProducer(kafkaPeers, nil)
 	if err != nil {
 		return err

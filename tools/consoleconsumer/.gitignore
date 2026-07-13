@@ -1,1 +1,45 @@
 consoleconsumer
+
+#Binaries and build artifacts
+/bin/
+/build/
+/dist/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+#Dependency directories
+vendor/
+
+#Temporary files
+tmp/
+temp/
+*.tmp
+*.swp
+*.swo
+*~
+
+#Logs
+*.log
+
+#Environment and local configuration
+.env
+.env.*
+!.env.example
+
+#IDEs and editors
+.idea/
+.vscode/
+*.iml
+
+#OS files
+.DS_Store
+Thumbs.db
+
+#Debugger
+__debug_bin*
+debug
